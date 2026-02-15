@@ -25,6 +25,43 @@ TOKEN = "8134791400:AAGP4mWwbiQbDH4HKbNBFQcUUZpfySrQR1c"
 PORT = 8080
 LOG_FILE = "/tmp/opencode_bot.log"
 
+# ============ 意图识别配置 ============
+INTENTS = {
+    "查数据库": {
+        "keywords": ["查数据库", "数据库", "query", "查询", "sql", "locations表"],
+        "template": "使用 postgres skill 查询 openclaw 数据库 locations 表的前 {limit} 条记录"
+    },
+    "写obsidian": {
+        "keywords": ["写obsidian", "笔记", "记录", "obsidian", "保存"],
+        "template": "使用 obsidian skill 将结果写入 notes/OpenCode 目录的 {note} 笔记"
+    },
+    "查表": {
+        "keywords": ["查看表", "show tables", "表结构"],
+        "template": "使用 postgres skill 查询 openclaw 数据库的所有表"
+    },
+    "写代码": {
+        "keywords": ["写代码", "帮我写", "创建文件", "新建文件"],
+        "template": "{detail}"
+    },
+    "解释代码": {
+        "keywords": ["解释", "分析", "review", "代码"],
+        "template": "分析并解释以下代码: {detail}"
+    }
+}
+
+INTENT_HINTS = """
+💡 常用指令:
+• 查数据库 / 数据库 / query → 查询数据库
+• 写obsidian / 笔记 → 写入 Obsidian
+• 查看表 / show tables → 查看数据库表
+• 写代码 / 创建文件 → 写代码
+• 解释代码 → 分析代码
+"""
+
+# ============ 会话记忆 ============
+SESSION_HISTORY = {}  # chat_id -> [{"role": "user/assistant", "content": "..."}]
+MAX_HISTORY = 10
+
 # ============ Flask App ============
 app = Flask(__name__)
 
@@ -33,11 +70,66 @@ RUNNING_TASKS = {}  # chat_id -> is_running
 
 # ============ 日志 ============
 def log(msg):
-    """写入日志"""
     timestamp = datetime.now().strftime("%H:%M:%S")
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(f"{timestamp} {msg}\n")
     print(f"{timestamp} {msg}")
+
+# ============ 意图识别 ============
+def detect_intent(text):
+    text_lower = text.lower()
+    for intent_name, intent_data in INTENTS.items():
+        for keyword in intent_data["keywords"]:
+            if keyword.lower() in text_lower:
+                return intent_name, intent_data["template"]
+    return None, None
+
+def build_prompt(user_text):
+    intent_name, template = detect_intent(user_text)
+    
+    if intent_name and template:
+        if "{detail}" in template:
+            prompt = template.format(detail=user_text)
+        elif "{limit}" in template:
+            prompt = template.format(limit="5")
+        elif "{note}" in template:
+            prompt = template.format(note="result")
+        else:
+            prompt = template
+        log(f"意图识别: {intent_name} -> {prompt[:50]}...")
+        return prompt
+    
+    return user_text
+
+# ============ 会话记忆 ============
+def add_to_history(chat_id, role, content):
+    if chat_id not in SESSION_HISTORY:
+        SESSION_HISTORY[chat_id] = []
+    
+    SESSION_HISTORY[chat_id].append({"role": role, "content": content})
+    
+    if len(SESSION_HISTORY[chat_id]) > MAX_HISTORY:
+        SESSION_HISTORY[chat_id] = SESSION_HISTORY[chat_id][-MAX_HISTORY:]
+
+def get_history_context(chat_id):
+    if chat_id not in SESSION_HISTORY:
+        return ""
+    
+    history = SESSION_HISTORY[chat_id]
+    if not history:
+        return ""
+    
+    context_parts = []
+    for item in history[-5:]:
+        role_emoji = "👤" if item["role"] == "user" else "🤖"
+        context_parts.append(f"{role_emoji} {item['content'][:100]}")
+    
+    return "\n".join(context_parts)
+
+def clear_history(chat_id):
+    if chat_id in SESSION_HISTORY:
+        SESSION_HISTORY[chat_id] = []
+        log(f"已清除会话历史: {chat_id}")
 
 # ============ Telegram API ============
 def send_message(chat_id, text, retry=3):
@@ -93,7 +185,10 @@ def send_typing(chat_id):
         pass
 
 # ============ OpenCode 执行 ============
-def run_opencode(prompt, chat_id):
+def run_opencode(prompt, chat_id, original_prompt=None):
+    if original_prompt is None:
+        original_prompt = prompt
+    
     log(f"开始执行: {prompt[:50]}...")
     
     send_message(chat_id, f"🔄 正在执行...")
@@ -131,6 +226,8 @@ def run_opencode(prompt, chat_id):
             send_message(chat_id, f"{final_text[3800:]}\n...(过长)")
         else:
             send_message(chat_id, f"✅ 完成!\n\n{final_text}")
+        
+        add_to_history(chat_id, "assistant", final_text[:500])
         
         log(f"执行完成")
         
@@ -185,15 +282,12 @@ def parse_opencode_output(output_lines):
 # ============ Webhook 路由 ============
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """处理 Telegram Webhook"""
-    # 必须立即返回 200
     try:
         update = request.get_json()
         
         if not update:
             return Response(status=200)
         
-        # 提取消息
         if 'message' in update:
             msg = update['message']
             chat_id = msg['chat']['id']
@@ -203,25 +297,34 @@ def webhook():
             
             # 处理命令
             if text == '/start':
+                add_to_history(chat_id, "user", text)
                 send_message(chat_id, 
                     "欢迎使用 OpenCode Bot!\n\n"
                     "发送任何任务，我会使用 OpenCode 来执行。\n\n"
-                    "示例:\n"
-                    "- 查询数据库\n"
-                    "- 创建一个文件\n"
-                    "- 帮我写代码")
+                    + INTENT_HINTS)
                     
             elif text == '/help':
+                add_to_history(chat_id, "user", text)
                 send_message(chat_id,
                     "可用命令:\n"
                     "/start - 欢迎\n"
                     "/help - 帮助\n"
-                    "/new - 新会话\n"
-                    "/status - 运行状态")
+                    "/new - 清除会话记忆\n"
+                    "/history - 查看会话历史\n"
+                    "/status - 运行状态\n\n"
+                    + INTENT_HINTS)
                     
             elif text == '/new':
-                send_message(chat_id, "✅ 已开始新会话")
+                clear_history(chat_id)
+                send_message(chat_id, "✅ 已清除会话记忆，开始新会话")
                 
+            elif text == '/history':
+                context = get_history_context(chat_id)
+                if context:
+                    send_message(chat_id, f"📝 会话历史:\n\n{context}")
+                else:
+                    send_message(chat_id, "暂无会话历史")
+                    
             elif text == '/status':
                 if RUNNING_TASKS.get(chat_id):
                     send_message(chat_id, "⏳ 任务运行中...")
@@ -232,13 +335,20 @@ def webhook():
                 send_message(chat_id, f"未知命令: {text}")
                 
             else:
-                # 检查是否已在运行
                 if RUNNING_TASKS.get(chat_id):
                     send_message(chat_id, "⏳ 已有任务在运行，请稍等...")
                 else:
-                    # 开始新任务
+                    add_to_history(chat_id, "user", text)
+                    prompt = build_prompt(text)
+                    context = get_history_context(chat_id)
+                    
+                    if context:
+                        full_prompt = f"上下文:\n{context}\n\n当前任务: {prompt}"
+                    else:
+                        full_prompt = prompt
+                    
                     RUNNING_TASKS[chat_id] = True
-                    Thread(target=run_opencode, args=(text, chat_id)).start()
+                    Thread(target=run_opencode, args=(full_prompt, chat_id, prompt)).start()
                     
     except Exception as e:
         log(f"处理错误: {e}")
