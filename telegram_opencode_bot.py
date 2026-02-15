@@ -101,7 +101,7 @@ def run_opencode(prompt, chat_id):
     
     import shlex
     safe_prompt = shlex.quote(prompt)
-    cmd = f'opencode run --format json -- {safe_prompt}'
+    cmd = f'opencode run --model opencode/minimax-m2.5-free --format json -- {safe_prompt}'
     log(f"CMD: {cmd}")
     
     try:
