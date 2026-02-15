@@ -44,11 +44,46 @@ def build_prompt(user_text):
     prompt = f"{user_text}，配置文件在 /Users/jiancao/env.txt"
     return prompt
 
+def build_prompt_with_memory(user_text, chat_id):
+    """构建带记忆的 prompt"""
+    memory = CONVERSATION_MEMORY.get(chat_id, [])
+    
+    if not memory:
+        # 没有记忆，直接使用原始 prompt
+        return build_prompt(user_text)
+    
+    # 构建记忆上下文
+    memory_context = "\n\n".join([
+        f"上一轮任务: {m['task']}\n上一轮结果: {m['result']}"
+        for m in memory[-MEMORY_ROUNDS:]
+    ])
+    
+    prompt = f"{memory_context}\n\n当前任务: {user_text}，配置文件在 /Users/jiancao/env.txt"
+    return prompt
+
+def save_to_memory(chat_id, task, result):
+    """保存任务和结果到记忆"""
+    if chat_id not in CONVERSATION_MEMORY:
+        CONVERSATION_MEMORY[chat_id] = []
+    
+    CONVERSATION_MEMORY[chat_id].append({
+        "task": task,
+        "result": result
+    })
+    
+    # 保留最近的记忆轮数
+    if len(CONVERSATION_MEMORY[chat_id]) > MEMORY_ROUNDS:
+        CONVERSATION_MEMORY[chat_id] = CONVERSATION_MEMORY[chat_id][-MEMORY_ROUNDS:]
+
+# ============ 配置 ============
+MEMORY_ROUNDS = 1  # 记忆轮数
+
 # ============ Flask App ============
 app = Flask(__name__)
 
 # 运行状态
 RUNNING_TASKS = {}  # chat_id -> is_running
+CONVERSATION_MEMORY = {}  # chat_id -> [{"task": "...", "result": "..."}, ...]
 
 # ============ 日志 ============
 def log(msg):
@@ -59,8 +94,31 @@ def log(msg):
 
 
 
+MAX_MESSAGE_LENGTH = 4000
+
+def clean_text(text):
+    """清理文本，移除 markdown 格式并截断长度"""
+    if not text:
+        return text
+    # 移除常见的 markdown 格式
+    import re
+    # 移除 **bold**, __italic__, `code`
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+    text = re.sub(r'__([^_]+)__', r'\1', text)
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    text = re.sub(r'```[\s\S]*?```', '', text)
+    # 移除 markdown 链接 [text](url) -> text
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    # 截断长度
+    if len(text) > MAX_MESSAGE_LENGTH:
+        text = text[:MAX_MESSAGE_LENGTH] + "\n...(内容过长)"
+    return text
+
 # ============ Telegram API ============
 def send_message(chat_id, text, retry=3):
+    # 清理文本
+    text = clean_text(text)
+    
     for attempt in range(retry):
         try:
             url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -309,6 +367,9 @@ def run_opencode(prompt, chat_id, original_prompt=None, max_retries=2):
             else:
                 send_message(chat_id, "✅ 执行完成")
             
+            # 保存到记忆
+            save_to_memory(chat_id, original_prompt, final_text if final_text else "")
+            
             log(f"执行完成")
             break
             
@@ -422,6 +483,8 @@ def webhook():
                     "/start - 欢迎\n"
                     "/help - 帮助\n"
                     "/status - 运行状态\n"
+                    "/memory - 查看记忆\n"
+                    "/clearmemory - 清除记忆\n"
                     "/reset - 重启 bot")
                 
             elif text == '/status':
@@ -430,6 +493,20 @@ def webhook():
                 else:
                     send_message(chat_id, "✅ 空闲")
                     
+            elif text == '/memory':
+                memory = CONVERSATION_MEMORY.get(chat_id, [])
+                if not memory:
+                    send_message(chat_id, "暂无记忆")
+                else:
+                    msg = "📋 记忆内容:\n\n"
+                    for i, m in enumerate(memory):
+                        msg += f"第 {i+1} 轮:\n任务: {m['task'][:100]}...\n结果: {m['result'][:200]}...\n\n"
+                    send_message(chat_id, msg)
+            
+            elif text == '/clearmemory':
+                CONVERSATION_MEMORY[chat_id] = []
+                send_message(chat_id, "🗑️ 记忆已清除")
+                
             elif text == '/reset':
                 send_message(chat_id, "🔄 正在重启 bot...")
                 def restart_bot():
@@ -457,7 +534,8 @@ def webhook():
                 if RUNNING_TASKS.get(chat_id):
                     send_message(chat_id, "⏳ 已有任务在运行，请稍等...")
                 else:
-                    prompt = build_prompt(text)
+                    # 使用带记忆的 prompt
+                    prompt = build_prompt_with_memory(text, chat_id)
                     full_prompt = prompt
                     
                     RUNNING_TASKS[chat_id] = True
