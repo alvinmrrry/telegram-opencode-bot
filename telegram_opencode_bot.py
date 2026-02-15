@@ -24,43 +24,25 @@ from datetime import datetime
 TOKEN = "8134791400:AAGP4mWwbiQbDH4HKbNBFQcUUZpfySrQR1c"
 PORT = 8080
 LOG_FILE = "/tmp/opencode_bot.log"
+# OPENCODE_MODEL = "opencode/minimax-m2.5-free"
+OPENCODE_MODEL = "opencode/kimi-k2.5-free"    
 
-# ============ 意图识别配置 ============
-INTENTS = {
-    "查数据库": {
-        "keywords": ["查数据库", "数据库", "query", "查询", "sql", "locations表"],
-        "template": "使用 postgres skill 查询 openclaw 数据库 locations 表的前 {limit} 条记录"
-    },
-    "写obsidian": {
-        "keywords": ["写obsidian", "笔记", "记录", "obsidian", "保存"],
-        "template": "使用 obsidian skill 将结果写入 notes/OpenCode 目录的 {note} 笔记"
-    },
-    "查表": {
-        "keywords": ["查看表", "show tables", "表结构"],
-        "template": "使用 postgres skill 查询 openclaw 数据库的所有表"
-    },
-    "写代码": {
-        "keywords": ["写代码", "帮我写", "创建文件", "新建文件"],
-        "template": "{detail}"
-    },
-    "解释代码": {
-        "keywords": ["解释", "分析", "review", "代码"],
-        "template": "分析并解释以下代码: {detail}"
-    }
-}
+# 加载环境变量
+OPENCODE_ENV = {}
+env_file = "/Users/jiancao/env.txt"
+if os.path.exists(env_file):
+    with open(env_file, 'r', encoding='utf-8') as f:
+        content = f.read().strip()
+        if content:
+            import re
+            # 解析 key: "value" 格式
+            for match in re.finditer(r'"([^"]+)":\s*"([^"]*)"', content):
+                key, value = match.groups()
+                OPENCODE_ENV[key] = value
 
-INTENT_HINTS = """
-💡 常用指令:
-• 查数据库 / 数据库 / query → 查询数据库
-• 写obsidian / 笔记 → 写入 Obsidian
-• 查看表 / show tables → 查看数据库表
-• 写代码 / 创建文件 → 写代码
-• 解释代码 → 分析代码
-"""
-
-# ============ 会话记忆 ============
-SESSION_HISTORY = {}  # chat_id -> [{"role": "user/assistant", "content": "..."}]
-MAX_HISTORY = 10
+def build_prompt(user_text):
+    prompt = f"{user_text}，配置文件在 /Users/jiancao/env.txt"
+    return prompt
 
 # ============ Flask App ============
 app = Flask(__name__)
@@ -75,61 +57,7 @@ def log(msg):
         f.write(f"{timestamp} {msg}\n")
     print(f"{timestamp} {msg}")
 
-# ============ 意图识别 ============
-def detect_intent(text):
-    text_lower = text.lower()
-    for intent_name, intent_data in INTENTS.items():
-        for keyword in intent_data["keywords"]:
-            if keyword.lower() in text_lower:
-                return intent_name, intent_data["template"]
-    return None, None
 
-def build_prompt(user_text):
-    intent_name, template = detect_intent(user_text)
-    
-    if intent_name and template:
-        if "{detail}" in template:
-            prompt = template.format(detail=user_text)
-        elif "{limit}" in template:
-            prompt = template.format(limit="5")
-        elif "{note}" in template:
-            prompt = template.format(note="result")
-        else:
-            prompt = template
-        log(f"意图识别: {intent_name} -> {prompt[:50]}...")
-        return prompt
-    
-    return user_text
-
-# ============ 会话记忆 ============
-def add_to_history(chat_id, role, content):
-    if chat_id not in SESSION_HISTORY:
-        SESSION_HISTORY[chat_id] = []
-    
-    SESSION_HISTORY[chat_id].append({"role": role, "content": content})
-    
-    if len(SESSION_HISTORY[chat_id]) > MAX_HISTORY:
-        SESSION_HISTORY[chat_id] = SESSION_HISTORY[chat_id][-MAX_HISTORY:]
-
-def get_history_context(chat_id):
-    if chat_id not in SESSION_HISTORY:
-        return ""
-    
-    history = SESSION_HISTORY[chat_id]
-    if not history:
-        return ""
-    
-    context_parts = []
-    for item in history[-5:]:
-        role_emoji = "👤" if item["role"] == "user" else "🤖"
-        context_parts.append(f"{role_emoji} {item['content'][:100]}")
-    
-    return "\n".join(context_parts)
-
-def clear_history(chat_id):
-    if chat_id in SESSION_HISTORY:
-        SESSION_HISTORY[chat_id] = []
-        log(f"已清除会话历史: {chat_id}")
 
 # ============ Telegram API ============
 def send_message(chat_id, text, retry=3):
@@ -185,61 +113,94 @@ def send_typing(chat_id):
         pass
 
 # ============ OpenCode 执行 ============
-def run_opencode(prompt, chat_id, original_prompt=None):
+def run_opencode(prompt, chat_id, original_prompt=None, max_retries=2):
     if original_prompt is None:
         original_prompt = prompt
     
-    log(f"开始执行: {prompt[:50]}...")
+    attempt = 0
+    last_error = None
     
-    send_message(chat_id, f"🔄 正在执行...")
-    send_typing(chat_id)
-    
-    import shlex
-    safe_prompt = shlex.quote(prompt)
-    cmd = f'opencode run --model opencode/minimax-m2.5-free --format json -- {safe_prompt}'
-    log(f"CMD: {cmd}")
-    
-    try:
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            env=os.environ.copy()
-        )
-        
-        # 执行完成后清理可能残留的 opencode 进程
-        subprocess.run("pkill -f 'opencode.*run --format'", shell=True, capture_output=True)
-        
-        full_output = result.stdout
-        log(f"输出长度: {len(full_output)}")
-        
-        # 解析输出
-        final_text = parse_opencode_output(full_output.split('\n'))
-        log(f"解析结果: {len(final_text)}")
-        
-        # 发送完成消息
-        if len(final_text) > 3800:
-            send_message(chat_id, f"✅ 完成!\n\n{final_text[:3800]}")
-            time.sleep(0.5)
-            send_message(chat_id, f"{final_text[3800:]}\n...(过长)")
+    while attempt <= max_retries:
+        if attempt > 0:
+            log(f"第 {attempt} 次重试: {prompt[:50]}...")
+            send_message(chat_id, f"🔄 第 {attempt} 次重试...")
+            send_typing(chat_id)
+            time.sleep(2)
         else:
-            send_message(chat_id, f"✅ 完成!\n\n{final_text}")
+            log(f"开始执行: {prompt[:50]}...")
+            send_message(chat_id, f"🔄 正在执行...")
+            send_typing(chat_id)
         
-        add_to_history(chat_id, "assistant", final_text[:500])
+        import shlex
+        safe_prompt = shlex.quote(prompt)
+        cmd = f'opencode run --model {OPENCODE_MODEL} --format json -- {safe_prompt}'
+        log(f"CMD: {cmd}")
         
-        log(f"执行完成")
-        
-    except subprocess.TimeoutExpired:
-        log("执行超时")
-        send_message(chat_id, "❌ 执行超时")
-    except Exception as e:
-        log(f"执行错误: {e}")
-        send_message(chat_id, f"❌ 错误:\n\n{str(e)}")
+        try:
+            env = os.environ.copy()
+            env.update(OPENCODE_ENV)
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=None,
+                env=env
+            )
+            
+            # 执行完成后清理可能残留的 opencode 进程
+            subprocess.run("pkill -f 'opencode.*run --format'", shell=True, capture_output=True)
+            
+            full_output = result.stdout
+            log(f"输出长度: {len(full_output)}")
+            
+            # 解析输出
+            final_text = parse_opencode_output(full_output.split('\n'))
+            log(f"解析结果: {len(final_text)}")
+            
+            # 发送完成消息
+            if len(final_text) > 3800:
+                send_message(chat_id, f"✅ 完成!\n\n{final_text[:3800]}")
+                time.sleep(0.5)
+                send_message(chat_id, f"{final_text[3800:]}\n...(过长)")
+            else:
+                send_message(chat_id, f"✅ 完成!\n\n{final_text}")
+            
+            log(f"执行完成")
+            break
+            
+        except subprocess.TimeoutExpired:
+            log(f"执行超时 (尝试 {attempt + 1}/{max_retries + 1})")
+            last_error = "执行超时"
+            # 清理残留进程
+            subprocess.run("pkill -f 'opencode.*run --format'", shell=True, capture_output=True)
+            attempt += 1
+            if attempt > max_retries:
+                send_message(chat_id, "❌ 执行超时，已重试多次")
+        except Exception as e:
+            log(f"执行错误: {e}")
+            last_error = str(e)
+            # 清理残留进程
+            subprocess.run("pkill -f 'opencode.*run --format'", shell=True, capture_output=True)
+            attempt += 1
+            if attempt > max_retries:
+                send_message(chat_id, f"❌ 错误:\n\n{last_error}")
+            else:
+                time.sleep(2)
     
-    finally:
-        RUNNING_TASKS[chat_id] = False
+    # 清理快照目录
+    try:
+        snapshot_dir = os.path.expanduser("~/.local/share/opencode/snapshot")
+        if os.path.exists(snapshot_dir):
+            for item in os.listdir(snapshot_dir):
+                item_path = os.path.join(snapshot_dir, item)
+                if os.path.isdir(item_path):
+                    subprocess.run(["rm", "-rf", item_path], capture_output=True)
+            log("已清理快照目录")
+    except Exception as e:
+        log(f"清理快照失败: {e}")
+    
+    RUNNING_TASKS[chat_id] = False
 
 def parse_opencode_output(output_lines):
     try:
@@ -297,39 +258,40 @@ def webhook():
             
             # 处理命令
             if text == '/start':
-                add_to_history(chat_id, "user", text)
                 send_message(chat_id, 
                     "欢迎使用 OpenCode Bot!\n\n"
-                    "发送任何任务，我会使用 OpenCode 来执行。\n\n"
-                    + INTENT_HINTS)
-                    
+                    "发送任何任务，我会使用 OpenCode 来执行。\n"
+                    "配置文件: /Users/jiancao/env.txt")
+                
             elif text == '/help':
-                add_to_history(chat_id, "user", text)
                 send_message(chat_id,
                     "可用命令:\n"
                     "/start - 欢迎\n"
                     "/help - 帮助\n"
-                    "/new - 清除会话记忆\n"
-                    "/history - 查看会话历史\n"
-                    "/status - 运行状态\n\n"
-                    + INTENT_HINTS)
-                    
-            elif text == '/new':
-                clear_history(chat_id)
-                send_message(chat_id, "✅ 已清除会话记忆，开始新会话")
+                    "/status - 运行状态\n"
+                    "/reset - 重启 bot")
                 
-            elif text == '/history':
-                context = get_history_context(chat_id)
-                if context:
-                    send_message(chat_id, f"📝 会话历史:\n\n{context}")
-                else:
-                    send_message(chat_id, "暂无会话历史")
-                    
             elif text == '/status':
                 if RUNNING_TASKS.get(chat_id):
                     send_message(chat_id, "⏳ 任务运行中...")
                 else:
                     send_message(chat_id, "✅ 空闲")
+                    
+            elif text == '/reset':
+                send_message(chat_id, "🔄 正在重启 bot...")
+                def restart_bot():
+                    func = request.environ.get('werkzeug.server.shutdown')
+                    if func:
+                        func()
+                    time.sleep(2)
+                    subprocess.Popen(
+                        ["python3", "/Users/jiancao/telegram_opencode_bot.py"],
+                        stdout=open("/tmp/opencode_bot.log", "a"),
+                        stderr=subprocess.STDOUT
+                    )
+                    time.sleep(1)
+                    exit(0)
+                Thread(target=restart_bot).start()
                     
             elif text.startswith('/'):
                 send_message(chat_id, f"未知命令: {text}")
@@ -338,14 +300,8 @@ def webhook():
                 if RUNNING_TASKS.get(chat_id):
                     send_message(chat_id, "⏳ 已有任务在运行，请稍等...")
                 else:
-                    add_to_history(chat_id, "user", text)
                     prompt = build_prompt(text)
-                    context = get_history_context(chat_id)
-                    
-                    if context:
-                        full_prompt = f"上下文:\n{context}\n\n当前任务: {prompt}"
-                    else:
-                        full_prompt = prompt
+                    full_prompt = prompt
                     
                     RUNNING_TASKS[chat_id] = True
                     Thread(target=run_opencode, args=(full_prompt, chat_id, prompt)).start()
