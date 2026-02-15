@@ -24,8 +24,8 @@ from datetime import datetime
 TOKEN = "8134791400:AAGP4mWwbiQbDH4HKbNBFQcUUZpfySrQR1c"
 PORT = 8080
 LOG_FILE = "/tmp/opencode_bot.log"
-# OPENCODE_MODEL = "opencode/minimax-m2.5-free"
-OPENCODE_MODEL = "opencode/kimi-k2.5-free"    
+OPENCODE_MODEL = "opencode/minimax-m2.5-free"
+# OPENCODE_MODEL = "opencode/kimi-k2.5-free"    
 
 # 加载环境变量
 OPENCODE_ENV = {}
@@ -113,6 +113,39 @@ def send_typing(chat_id):
         pass
 
 # ============ OpenCode 执行 ============
+def send_update(chat_id, event_type, content, buffer, force_send=False):
+    """实时发送更新到 Telegram"""
+    if not content:
+        return buffer
+    
+    emoji_map = {
+        "thinking": "💭",
+        "reasoning": "💭",
+        "text": "📝",
+        "tool": "🔧",
+        "info": "▶️",
+        "error": "❌"
+    }
+    emoji = emoji_map.get(event_type, "📝")
+    
+    # 累积内容
+    if event_type in buffer:
+        buffer[event_type] += content
+    else:
+        buffer[event_type] = content
+    
+    current = buffer[event_type]
+    
+    # 内容太长时分段发送
+    if len(current) > 1000 or force_send:
+        send_message(chat_id, f"{emoji} {current[:1000]}")
+        buffer[event_type] = current[1000:] if len(current) > 1000 else ""
+    elif force_send and current:
+        send_message(chat_id, f"{emoji} {current}")
+        buffer[event_type] = ""
+    
+    return buffer
+
 def run_opencode(prompt, chat_id, original_prompt=None, max_retries=2):
     if original_prompt is None:
         original_prompt = prompt
@@ -128,7 +161,9 @@ def run_opencode(prompt, chat_id, original_prompt=None, max_retries=2):
             time.sleep(2)
         else:
             log(f"开始执行: {prompt[:50]}...")
-            send_message(chat_id, f"🔄 正在执行...")
+            # 显示任务描述
+            display_prompt = original_prompt[:100] + "..." if len(original_prompt) > 100 else original_prompt
+            send_message(chat_id, f"🔄 正在执行: {display_prompt}")
             send_typing(chat_id)
         
         import shlex
@@ -139,32 +174,140 @@ def run_opencode(prompt, chat_id, original_prompt=None, max_retries=2):
         try:
             env = os.environ.copy()
             env.update(OPENCODE_ENV)
-            result = subprocess.run(
+            
+            # 使用 Popen 实现流式输出
+            process = subprocess.Popen(
                 cmd,
                 shell=True,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=None,
                 env=env
             )
             
-            # 执行完成后清理可能残留的 opencode 进程
+            # 内容缓冲
+            content_buffer = {}
+            last_update_time = time.time()
+            update_interval = 60  # 每 60 秒发送一次保底更新
+            first_tool_completed = False  # 跟踪第一个工具调用完成
+            
+            # 流式读取输出
+            while True:
+                # 检查进程是否结束
+                if process.poll() is not None:
+                    # 处理剩余内容
+                    for event_type, content in content_buffer.items():
+                        if content:
+                            if event_type == "thinking":
+                                send_message(chat_id, f"💭 {content}")
+                            elif event_type == "text":
+                                send_message(chat_id, f"📝 {content}")
+                            elif event_type == "tool":
+                                send_message(chat_id, f"🔧 {content}")
+                            elif event_type == "error":
+                                send_message(chat_id, f"❌ {content}")
+                    break
+                
+                # 实时读取输出
+                line = None
+                if process.stdout:
+                    line = process.stdout.readline()
+                if line:
+                    try:
+                        event = json.loads(line.strip())
+                        event_type = event.get('type', '')
+                        part = event.get('part', {})
+                        part_type = part.get('type', '')
+                        
+                        # 处理不同类型的事件
+                        # thinking/reasoning
+                        if part_type in ['thinking', 'reasoning']:
+                            thinking = part.get('text', '')
+                            if thinking:
+                                content_buffer = send_update(chat_id, "thinking", thinking, content_buffer)
+                        
+                        # text output
+                        elif event_type == "text" or part_type == "text":
+                            text = part.get('text', '')
+                            if text:
+                                content_buffer = send_update(chat_id, "text", text, content_buffer)
+                        
+                        # tool use
+                        elif event_type == "tool_use":
+                            tool_name = part.get('tool', '')
+                            if tool_name:
+                                state = part.get('state', {})
+                                status = state.get('status', '')
+                                
+                                if status == "completed":
+                                    if not first_tool_completed:
+                                        # 第一个工具完成，跳过显示内容（通常是读取配置）
+                                        first_tool_completed = True
+                                        content_buffer = send_update(chat_id, "tool", f"🔧 {tool_name} 完成", content_buffer, force_send=True)
+                                    else:
+                                        # 其他工具调用显示内容
+                                        result = state.get('output', '')[:500] if state.get('output') else ''
+                                        content_buffer = send_update(chat_id, "tool", f"🔧 {tool_name} 完成\n{result}", content_buffer, force_send=True)
+                                else:
+                                    content_buffer = send_update(chat_id, "tool", f"🔧 调用 {tool_name}...", content_buffer, force_send=True)
+                        
+                        # step start
+                        elif event_type == "step_start":
+                            content_buffer = send_update(chat_id, "info", "▶️ 开始新步骤", content_buffer, force_send=True)
+                        
+                        # error
+                        elif event_type == "error":
+                            error = part.get('error', '')
+                            if not error:
+                                error = event.get('error', {})
+                            if error:
+                                content_buffer = send_update(chat_id, "error", str(error)[:500], content_buffer, force_send=True)
+                        
+                        send_typing(chat_id)
+                    
+                    except json.JSONDecodeError:
+                        pass
+                
+                # 定期发送保底更新
+                current_time = time.time()
+                if current_time - last_update_time > update_interval:
+                    elapsed_minutes = (attempt * 1800 + int(current_time - last_update_time)) // 60
+                    
+                    # 发送当前缓冲的内容
+                    for event_type, content in content_buffer.items():
+                        if content:
+                            emoji_map = {"thinking": "💭", "text": "📝", "tool": "🔧", "info": "▶️", "error": "❌"}
+                            emoji = emoji_map.get(event_type, "📝")
+                            send_message(chat_id, f"{emoji} {content[:500]}")
+                    
+                    content_buffer = {}
+                    send_message(chat_id, f"⏳ 仍在运行中... ({elapsed_minutes} 分钟)")
+                    send_typing(chat_id)
+                    last_update_time = current_time
+                
+                time.sleep(0.05)
+            
+            # 等待进程完全结束
+            process.wait()
+            
+            # 清理残留进程
             subprocess.run("pkill -f 'opencode.*run --format'", shell=True, capture_output=True)
             
-            full_output = result.stdout
+            full_output = process.stdout.read() if process.stdout else ""
+            output_lines = full_output.split('\n') if full_output else []
             log(f"输出长度: {len(full_output)}")
             
             # 解析输出
-            final_text = parse_opencode_output(full_output.split('\n'))
+            final_text = parse_opencode_output(output_lines)
             log(f"解析结果: {len(final_text)}")
             
-            # 发送完成消息
-            if len(final_text) > 3800:
-                send_message(chat_id, f"✅ 完成!\n\n{final_text[:3800]}")
-                time.sleep(0.5)
-                send_message(chat_id, f"{final_text[3800:]}\n...(过长)")
+            # 发送完成消息 (内容已在实时流中发送，简短提示即可)
+            if final_text and len(final_text) > 100:
+                send_message(chat_id, f"✅ 执行完成\n\n{final_text[:500]}...")
+            elif final_text:
+                send_message(chat_id, f"✅ 执行完成\n\n{final_text}")
             else:
-                send_message(chat_id, f"✅ 完成!\n\n{final_text}")
+                send_message(chat_id, "✅ 执行完成")
             
             log(f"执行完成")
             break
@@ -215,24 +358,30 @@ def parse_opencode_output(output_lines):
                 event = json.loads(line_str)
                 event_type = event.get('type', '')
                 part = event.get('part', {})
+                part_type = part.get('type', '')
                 
-                if event_type == 'text':
+                # text output
+                if event_type == 'text' or part_type == 'text':
                     text = part.get('text', '')
                     if text:
                         texts.append(text)
-                elif event_type == 'text_delta':
-                    text = part.get('text', '')
-                    if text:
-                        texts.append(text)
+                
+                # step_finish - get final text if available
+                elif event_type == 'step_finish':
+                    # Check if there's any final content
+                    reason = part.get('reason', '')
+                    if reason == 'stop':
+                        # This is the final step, could contain summary
+                        pass
             except (json.JSONDecodeError, TypeError):
-                if line_str:
+                if line_str and not line_str.startswith('{'):
                     texts.append(line_str)
         
         result = ''.join(texts)
         
         # 如果没有 JSON 输出，尝试使用原始行
         if not result.strip():
-            result = '\n'.join([l for l in output_lines if l and l.strip()])
+            result = '\n'.join([l for l in output_lines if l and l.strip() and not l.strip().startswith('{')])
         
         return result.strip()
         
@@ -253,6 +402,10 @@ def webhook():
             msg = update['message']
             chat_id = msg['chat']['id']
             text = msg.get('text', '')
+            
+            # 去除 @bot_username 前缀
+            import re
+            text = re.sub(r'^@\S+\s+', '', text)
             
             log(f"收到消息: {text[:30]}... (chat_id: {chat_id})")
             
@@ -297,6 +450,10 @@ def webhook():
                 send_message(chat_id, f"未知命令: {text}")
                 
             else:
+                # 忽略空消息
+                if not text or not text.strip():
+                    return Response(status=200)
+                
                 if RUNNING_TASKS.get(chat_id):
                     send_message(chat_id, "⏳ 已有任务在运行，请稍等...")
                 else:
@@ -304,7 +461,7 @@ def webhook():
                     full_prompt = prompt
                     
                     RUNNING_TASKS[chat_id] = True
-                    Thread(target=run_opencode, args=(full_prompt, chat_id, prompt)).start()
+                    Thread(target=run_opencode, args=(full_prompt, chat_id, text)).start()
                     
     except Exception as e:
         log(f"处理错误: {e}")
