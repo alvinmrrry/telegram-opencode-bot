@@ -76,7 +76,7 @@ def save_to_memory(chat_id, task, result):
         CONVERSATION_MEMORY[chat_id] = CONVERSATION_MEMORY[chat_id][-MEMORY_ROUNDS:]
 
 # ============ 配置 ============
-MEMORY_ROUNDS = 1  # 记忆轮数
+MEMORY_ROUNDS = 0  # 记忆轮数
 
 # ============ Flask App ============
 app = Flask(__name__)
@@ -97,10 +97,9 @@ def log(msg):
 MAX_MESSAGE_LENGTH = 4000
 
 def clean_text(text):
-    """清理文本，移除 markdown 格式并截断长度"""
+    """清理文本，移除 markdown 格式"""
     if not text:
         return text
-    # 移除常见的 markdown 格式
     import re
     # 移除 **bold**, __italic__, `code`
     text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
@@ -109,52 +108,82 @@ def clean_text(text):
     text = re.sub(r'```[\s\S]*?```', '', text)
     # 移除 markdown 链接 [text](url) -> text
     text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
-    # 截断长度
-    if len(text) > MAX_MESSAGE_LENGTH:
-        text = text[:MAX_MESSAGE_LENGTH] + "\n...(内容过长)"
+    # 移除标题 ### Title -> Title
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # 移除列表符号 - 或 * 开头
+    text = re.sub(r'^[\-\*]\s+', '', text, flags=re.MULTILINE)
+    # 移除数字列表 1. 2. 开头
+    text = re.sub(r'^\d+\.\s+', '', text, flags=re.MULTILINE)
     return text
+
+def split_message(text):
+    """将长文本分割成多条消息"""
+    if len(text) <= MAX_MESSAGE_LENGTH:
+        return [text]
+    
+    messages = []
+    while len(text) > MAX_MESSAGE_LENGTH:
+        # 找到最后一个换行符位置，避免在单词中间截断
+        split_pos = text[:MAX_MESSAGE_LENGTH].rfind('\n')
+        if split_pos == -1:
+            split_pos = MAX_MESSAGE_LENGTH
+        
+        messages.append(text[:split_pos])
+        text = text[split_pos:]
+    
+    if text:
+        messages.append(text)
+    
+    return messages
 
 # ============ Telegram API ============
 def send_message(chat_id, text, retry=3):
     # 清理文本
     text = clean_text(text)
     
-    for attempt in range(retry):
-        try:
-            url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-            data = {
-                "chat_id": chat_id,
-                "text": text
-            }
-            
-            json_data = json.dumps(data)
-            log(f"发送数据: {json_data[:200]}")
-            
-            req = urllib.request.Request(
-                url,
-                data=json_data.encode('utf-8'),
-                headers={'Content-Type': 'application/json'}
-            )
-            
-            with urllib.request.urlopen(req, timeout=15) as response:
-                result = response.read().decode('utf-8')
-                log(f"发送结果: {result[:200]}")
-                return json.loads(result)
+    # 分割成长消息
+    messages = split_message(text)
+    
+    for msg in messages:
+        for attempt in range(retry):
+            try:
+                url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+                data = {
+                    "chat_id": chat_id,
+                    "text": msg
+                }
                 
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode('utf-8') if e.fp else str(e)
-            log(f"HTTP错误 {e.code}: {error_body[:300]}")
-            if attempt < retry - 1:
-                time.sleep(2)
-            else:
-                return None
-        except Exception as e:
-            log(f"发送消息失败 (尝试 {attempt+1}/{retry}): {e}")
-            if attempt < retry - 1:
-                time.sleep(2)
-            else:
-                return None
-    return None
+                json_data = json.dumps(data)
+                log(f"发送数据: {json_data[:200]}")
+                
+                req = urllib.request.Request(
+                    url,
+                    data=json_data.encode('utf-8'),
+                    headers={'Content-Type': 'application/json'}
+                )
+                
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    result = response.read().decode('utf-8')
+                    log(f"发送结果: {result[:200]}")
+                
+                time.sleep(0.3)
+                break
+                    
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode('utf-8') if e.fp else str(e)
+                log(f"HTTP错误 {e.code}: {error_body[:300]}")
+                if attempt < retry - 1:
+                    time.sleep(2)
+                else:
+                    return None
+            except Exception as e:
+                log(f"发送消息失败 (尝试 {attempt+1}/{retry}): {e}")
+                if attempt < retry - 1:
+                    time.sleep(2)
+                else:
+                    return None
+    
+    return True
 
 def send_typing(chat_id):
     """发送 typing 状态"""
