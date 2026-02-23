@@ -1,0 +1,12 @@
+{
+  "name": "pm-agent",
+  "version": "1.0.0",
+  "description": "Decentralized Project Management with autonomous subagents",
+  "triggers": ["pm-agent", "project management", "spawn pm", "decentralized coordination"],
+  "capabilities": [
+    "spawn subagents",
+    "coordinate via STATE.yaml",
+    "auto-unblock dependencies",
+    "parallel execution"
+  ]
+}
